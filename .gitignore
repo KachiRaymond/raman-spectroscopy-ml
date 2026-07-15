@@ -1,0 +1,10 @@
+__pycache__/
+.ipynb_checkpoints/
+*.pyc
+
+.vscode/
+
+*.pkl
+
+data/raw/
+d*ta/processed/
