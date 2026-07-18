@@ -1,109 +1,137 @@
+import os
+import glob
 import re
-from pathlib import Path
-
-import numpy as np
 import pandas as pd
-
-from .config import GROUND_TRUTH_FILE
+import numpy as np
 
 
 def extract_id(filename):
-    """
-    Supports:
-
-    Scan 2137.csv
-    2137.csv
-    2137_1.csv
-    """
-
-    stem = Path(filename).stem
-
-    match = re.search(r"(\d+)", stem)
-
-    if match:
-        return str(int(match.group(1)))
-
-    return stem
+    match = re.search(r'Scan\s+(\d+)', filename)
+    return str(int(match.group(1))) if match else None
 
 
 def read_raman_csv(filepath):
-
-    df = pd.read_csv(filepath, header=None)
-
-    if df.shape[1] < 2:
-        raise ValueError(f"Invalid Raman file: {filepath}")
-
-    return df.iloc[:, 1].values
+    try:
+        df = pd.read_csv(filepath, header=None)
+        if df.shape[1] < 2:
+            raise ValueError("Invalid format")
+        return df.iloc[:, 1].values  # only intensity
+    except Exception as e:
+        print(f"[ERROR] {filepath}: {e}")
+        return None
 
 
 def process_folder(folder_path):
+    
+    files = glob.glob(os.path.join(folder_path, "*.csv"))
+     
+    all_data = []
+    max_len = 0
 
-    folder_path = Path(folder_path)
+    # First pass: read + find max length
+    temp = []
+    for f in files:
+        fname = os.path.basename(f)
+        fid = extract_id(fname)
 
-    spectra = []
+        if fid is None:
+            continue
 
-    csv_files = sorted(folder_path.glob("*.csv"))
+        intensity = read_raman_csv(f)
+        if intensity is None:
+            continue
 
-    for file in csv_files:
+        max_len = max(max_len, len(intensity))
 
-        try:
+        temp.append((fid, fname, intensity))
 
-            intensity = read_raman_csv(file)
+    print(f"[INFO] max spectrum length = {max_len}")
 
-            sample_id = extract_id(file.name)
+    # Second pass: pad + build rows
+    for fid, fname, intensity in temp:
+        padded = np.full(max_len, np.nan)
+        padded[:len(intensity)] = intensity
 
-            row = {
-                "sample_id": sample_id
-            }
+        row = [fid, fname] + padded.tolist()
+        all_data.append(row)
 
-            for i, value in enumerate(intensity):
-                row[f"f_{i}"] = value
+    # Build column names
+    cols = ["id", "filename"] + [f"f{i+1}" for i in range(max_len)]
 
-            spectra.append(row)
+    df_final = pd.DataFrame(all_data, columns=cols)
 
-        except Exception as e:
-            print(f"Failed: {file.name}")
-            print(e)
+    return df_final
 
-    return pd.DataFrame(spectra)
+if __name__ == "__main__":
+     
+
+    df = process_folder(path_to_data)
+
+    print(df.shape)
+    print(df.head())
+
+    df.to_csv("./Raman_ML/data/raman_data_22_06_2026.csv", index=False)
 
 
-def merge_ground_truth(
-    spectra_df,
-    gt_path=GROUND_TRUTH_FILE
-):
+def merge_ground_truth(df_spectra, gt_path):
+    """
+    Merge Raman wide dataframe with ground truth CSV (from file path)
 
-    gt = pd.read_csv(gt_path)
+    Parameters
+    ----------
+    df_spectra : pandas.DataFrame
+        Output from process_folder()
+        columns: id, filename, f1, f2, ...
 
-    gt["sample_id"] = gt["sample_id"].astype(str)
+    gt_path : str
+        Path to ground truth CSV file
 
-    spectra_df["sample_id"] = spectra_df["sample_id"].astype(str)
+    Returns
+    -------
+    pandas.DataFrame
+        Fully merged dataframe
+    """
 
-    merged = spectra_df.merge(
-        gt,
-        on="sample_id",
+    # ---------- Load ground truth ----------
+    df_gt = pd.read_csv(gt_path)
+
+    # ---------- Fix ID formatting ----------
+    # spectra IDs already clean (from earlier fix), but enforce
+    df_spectra = df_spectra.copy()
+    df_spectra["ID"] = df_spectra["id"].astype(str).str.strip()
+
+    # ground truth IDs → remove any leading zeros just in case
+    df_gt["ID"] = df_gt["ID"].astype(str).str.strip().apply(lambda x: str(int(x)))
+
+    # ---------- Clean text fields ----------
+    for col in df_gt.columns:
+        if df_gt[col].dtype == object:
+            df_gt[col] = (
+                df_gt[col]
+                .fillna("")
+                .astype(str)
+                .str.strip()
+            )
+
+    # replace "0" with empty (your encoding)
+    component_cols = [
+        "Component1", "Component2", "Component3",
+        "Component4", "Component5", "Component6"
+    ]
+
+    for col in component_cols:
+        if col in df_gt.columns:
+            df_gt[col] = df_gt[col].replace("0", "")
+
+    # ---------- Merge ----------
+    df_merged = pd.merge(
+        df_gt,
+        df_spectra,
+        on="ID",
         how="inner"
     )
 
-    return merged
+    # optional: drop duplicate id column
+    df_merged = df_merged.drop(columns=["id"])
 
-
-def save_processed_data(
-    training_folder,
-    output_file,
-    gt_path=GROUND_TRUTH_FILE
-):
-
-    spectra_df = process_folder(training_folder)
-
-    final_df = merge_ground_truth(
-        spectra_df,
-        gt_path
-    )
-
-    final_df.to_csv(
-        output_file,
-        index=False
-    )
-
-    return final_df
+    return df_merged

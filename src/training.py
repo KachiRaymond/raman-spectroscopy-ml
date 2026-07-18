@@ -2,185 +2,157 @@ import json
 import pickle
 
 import pandas as pd
+import numpy as np
 
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import confusion_matrix, classification_report
+from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
 from xgboost import XGBClassifier
 
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import (
-    accuracy_score,
-    classification_report,
-    confusion_matrix
-)
+from src.config import(TRAINED_MODELS_DIR, RANDOM_STATE, TEST_SIZE)
 
-from .config import (
-    RANDOM_STATE,
-    TEST_SIZE
-)
-
-
-TARGET_COLUMN = "label"
-
+# -------------------------------
+# 1. Prepare data
+# -------------------------------
 
 def prepare_data(df):
+    df = df.copy()
 
-    X = df.drop(
-        columns=["sample_id", TARGET_COLUMN]
+    # ---- clean column names ----
+    df.columns = (
+        df.columns
+        .str.strip()
+        .str.replace("\n", " ")
+        .str.replace("\r", " ")
     )
 
-    y = df[TARGET_COLUMN]
+    #print("\n[DEBUG] Columns:")
+    #print(df.columns.tolist())
+
+    # ---- detect target column ----
+    target_candidates = [c for c in df.columns if "primary" in c.lower()]
+    
+    if len(target_candidates) == 0:
+        raise ValueError("No Primary component column found")
+
+    target_col = target_candidates[0]
+    print(f"[INFO] Using target column: {target_col}")
+
+    # ---- create binary target ----
+    df["target"] = (
+        df[target_col]
+        .astype(str)
+        .str.strip()
+        .str.lower()
+        .eq("paracetamol")
+    ).astype(int)
+
+    # ---- feature columns ----
+    feature_cols = [c for c in df.columns if c.startswith("f")]
+
+    print(f"[INFO] Number of features: {len(feature_cols)}")
+
+    # ---- convert to numeric (safe) ----
+    X = df[feature_cols].apply(pd.to_numeric, errors="coerce").values
+
+    # ✅ instead of dropping → FIX NaNs
+    nan_count = np.isnan(X).sum()
+    #print(f"[INFO] Total NaNs in X: {nan_count}")
+
+    # ---- replace NaNs with 0 ----
+    X = np.nan_to_num(X, nan=0.0).astype(np.float32)
+
+    y = df["target"].values
+
+    #print(f"[INFO] Final usable samples: {len(y)}")
+
+    # ---- normalize spectra ----
+    max_vals = np.max(X, axis=1, keepdims=True)
+    max_vals[max_vals == 0] = 1   # avoid divide by zero
+    X = X / max_vals
 
     return X, y
 
+# -------------------------------
+# 2. Train-test split
+# -------------------------------
 
 def split_data(X, y):
-
     return train_test_split(
-        X,
-        y,
+        X, y,
         test_size=TEST_SIZE,
         random_state=RANDOM_STATE,
         stratify=y
     )
 
 
-def train_model(
-    model,
-    X_train,
-    y_train,
-    scale=False
-):
+# -------------------------------
+# 3. Train model
+# -------------------------------
 
+def train_model(model, X_train, y_train, scale=False):
     scaler = None
 
     if scale:
-
         scaler = StandardScaler()
-
         X_train = scaler.fit_transform(X_train)
 
     model.fit(X_train, y_train)
-
     return model, scaler
 
 
-def evaluate_model(
-    model,
-    X_test,
-    y_test,
-    scaler=None
-):
+# -------------------------------
+# 4. Evaluate model
+# -------------------------------
 
+def evaluate_model(model, X_test, y_test, scaler=None):
+    
     if scaler is not None:
         X_test = scaler.transform(X_test)
 
-    preds = model.predict(X_test)
+    y_pred = model.predict(X_test)
 
-    results = {
-        "accuracy": float(
-            accuracy_score(y_test, preds)
-        ),
-        "classification_report":
-            classification_report(
-                y_test,
-                preds,
-                output_dict=True
-            ),
-        "confusion_matrix":
-            confusion_matrix(
-                y_test,
-                preds
-            ).tolist()
-    }
+    cm = confusion_matrix(y_test, y_pred)
 
-    return results
+    print("\nConfusion Matrix:")
+    print(cm)
+
+    print("\nClassification Report:")
+    print(classification_report(y_test, y_pred))
+
+    return cm
 
 
-def save_artifacts(
-    model,
-    scaler,
-    model_path
-):
+# -------------------------------
+# 5. Pipeline runner
+# -------------------------------
 
-    with open(model_path, "wb") as f:
+def run_pipeline(df, model, scale=False, model_name="model"):
 
-        pickle.dump(
-            {
-                "model": model,
-                "scaler": scaler
-            },
-            f
-        )
-
-
-def run_pipeline(
-    df,
-    model,
-    model_name,
-    scale=False,
-    model_output=None,
-    metrics_output=None
-):
+    print(f"\n===== {model_name.upper()} =====")
 
     X, y = prepare_data(df)
 
     X_train, X_test, y_train, y_test = split_data(X, y)
 
-    model, scaler = train_model(
-        model,
-        X_train,
-        y_train,
-        scale
-    )
+    trained_model, scaler = train_model(model, X_train, y_train, scale)
 
-    metrics = evaluate_model(
-        model,
-        X_test,
-        y_test,
-        scaler
-    )
+    cm = evaluate_model(trained_model, X_test, y_test, scaler)
 
-    if model_output:
-        save_artifacts(
-            model,
-            scaler,
-            model_output
-        )
+    # Save model and scaler
+    model_bundle = {
+        "model": trained_model,
+        "scaler": scaler
+    }
 
-    if metrics_output:
-        with open(metrics_output, "w") as f:
-            json.dump(metrics, f, indent=4)
+    TRAINED_MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
-    return metrics
+    model_file = TRAINED_MODELS_DIR / f"{model_name.lower()}.pkl"
 
+    with open(model_file, "wb") as f:
+        pickle.dump(model_bundle, f)
 
-if __name__ == "__main__":
+    print(f"[INFO] Saved model to {model_file}")
 
-    df = pd.read_csv(
-        "../data/processed/training_dataset.csv"
-    )
-
-    svm_metrics = run_pipeline(
-        df=df,
-        model=SVC(
-            probability=True
-        ),
-        model_name="svm",
-        scale=True,
-        model_output="../models/trained/svm.pkl",
-        metrics_output="../models/metrics/svm.json"
-    )
-
-    xgb_metrics = run_pipeline(
-        df=df,
-        model=XGBClassifier(
-            random_state=42
-        ),
-        model_name="xgb",
-        model_output="../models/trained/xgb.pkl",
-        metrics_output="../models/metrics/xgb.json"
-    )
-
-    print(svm_metrics)
-    print(xgb_metrics)
+    return trained_model, cm
